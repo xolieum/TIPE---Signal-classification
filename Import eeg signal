@@ -1,0 +1,15 @@
+import mne
+
+# Charger un fichier EEG au format EDF
+file_path = "chemin/vers/votre_fichier.edf"
+raw = mne.io.read_raw_edf(file_path, preload=True)
+
+# Afficher des informations sur le signal
+print(raw.info)
+
+# Accéder aux données sous forme de numpy array
+data, times = raw[:]
+
+# Afficher les premières valeurs
+print("Données EEG :", data)
+print("Temps :", times)
