@@ -1,0 +1,31 @@
+import numpy as np
+import numpy as np
+import matplotlib.pyplot as plt
+
+# definition du signal
+dt = 0.1
+T1 = 2
+T2 = 10
+t = np.arange(0, T1*T2, dt)
+signal = 2*np.cos(2*np.pi/T1*t) + np.cos(2*np.pi/T2*t) + 4*np.cos(2*np.pi/T1*t) + 8*np.cos(5*np.pi/T2*t+3) 
+
+x=t
+
+# affichage du signal
+plt.subplot(211)
+plt.plot(x,signal)
+plt.xlim(0)
+
+# calcul de la transformee de Fourier et des frequences
+fourier = np.fft.fft(signal)
+n = signal.size
+freq = np.fft.fftfreq(n, d=dt)
+x=freq
+
+# affichage de la transformee de Fourier
+plt.subplot(212)
+plt.plot(freq[:n//2], np.abs(fourier)[:n//2], label="real")
+plt.xlim(0)
+plt.legend()
+
+plt.show()
