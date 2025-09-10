@@ -23,7 +23,7 @@ freq = np.fft.fftfreq(n, d=dt)
 x=freq
 
 # affichage de la transformee de Fourier
-plt.subplot(212)
+plt.subplot(211)
 plt.plot(freq[:n//2], np.abs(fourier)[:n//2], label="real")
 plt.xlim(0)
 plt.legend()
