@@ -1,54 +1,41 @@
-import mne
+import os
 import numpy as np
+import mne
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt  # à ajouter en haut du script
-import os
-from random import randint
+from torch.utils.data import Dataset, DataLoader, random_split
+import matplotlib.pyplot as plt
+import wandb
 
+# === Paramètres ===
+DATA_DIR = "/Users/ewen/Desktop/TIPE/BDD/Training-signals"
+WINDOW_SEC = 30
+BATCH_SIZE = 128
+NUM_CLASSES = 5
+EPOCHS = 100
+LR = 1e-5
+
+# === Initialisation wandb ===
+wandb.init(
+    project="sleep_stage_classification",
+    config={
+        "epochs": EPOCHS,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LR,
+        "window_sec": WINDOW_SEC,
+        "num_classes": NUM_CLASSES,
+    }
+)
+config = wandb.config
+
+# === Liste des fichiers EDF ===
 def list_sleep_edf_files(data_dir):
-    psg_file = sorted([
-        os.path.join(data_dir, f)
-        for f in os.listdir(data_dir)
-        if f.endswith("-PSG.edf")
-    ])
-    
-    hypnogram_file = sorted([
-        os.path.join(data_dir, f)
-        for f in os.listdir(data_dir)
-        if f.endswith("-Hypnogram.edf")
-    ])
-    
-    print(f"📄 {len(psg_file)} fichiers PSG trouvés")
-    print(f"🧠 {len(hypnogram_file)} fichiers Hypnogramme trouvés")
-    
-    return psg_file, hypnogram_file
-
-losses = []  # stocker les pertes
-loss_validation = [] #stocker les résultats de l'évaluiation intra entrainement
-epochs = [] #Sotcker le nombre d'épochs
-# === Chargement des fichiers ===
-
-data_dir = "/Users/ewen/Desktop/TIPE/BDD/Training-signals"
-psg_file, hypnogram_file = list_sleep_edf_files(data_dir)
-
-for psg_path, hypnogram_path in zip(psg_file, hypnogram_file):
-    raw = mne.io.read_raw_edf(psg_path, preload=True)
-    annotations = mne.read_annotations(hypnogram_path)
-    raw.set_annotations(annotations)
-    raw.pick_channels(['EEG Fpz-Cz'])
-
-sfreq = int(raw.info["sfreq"])
-window_sec = 30
-samples_per_window = window_sec * sfreq
-
-# === Conversion des annotations en événements ===
-events, event_id = mne.events_from_annotations(raw)
-print(f"Nombre d'événements : {len(events)}")
-print(f"Event IDs : {event_id}")
-print(f"Durée d'enregistrement : {raw.times[-1] / 60:.2f} minutes")
+    psg_files = sorted([os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith("-PSG.edf")])
+    hyp_files = sorted([os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith("-Hypnogram.edf")])
+    print(f"📄 {len(psg_files)} fichiers PSG trouvés")
+    print(f"🧠 {len(hyp_files)} fichiers Hypnogramme trouvés")
+    return psg_files, hyp_files
 
 # === Mapping des labels ===
 label_map = {
@@ -60,161 +47,148 @@ label_map = {
     'Sleep stage R': 4,
 }
 
-# === Filtrage des fenêtres valides et extraction ===
-x_all, y_all = [], []
+# === Extraction des fenêtres ===
+def extract_windows(psg_files, hyp_files, window_sec):
+    x_all, y_all = [], []
+    for psg_path, hyp_path in zip(psg_files, hyp_files):
+        raw = mne.io.read_raw_edf(psg_path, preload=True)
+        raw.pick_channels(['EEG Fpz-Cz'])
+        sfreq = int(raw.info['sfreq'])
+        samples_per_window = window_sec * sfreq
 
-for psg_path, hypnogram_path in zip(psg_file, hypnogram_file):
-    raw = mne.io.read_raw_edf(psg_path, preload=True)
-    annotations = mne.read_annotations(hypnogram_path)
-    raw.set_annotations(annotations)
-    raw.pick_channels(['EEG Fpz-Cz'])
+        annotations = mne.read_annotations(hyp_path)
+        raw.set_annotations(annotations)
 
-    sfreq = int(raw.info["sfreq"])
-    samples_per_window = window_sec * sfreq
+        for annot in annotations:
+            label = label_map.get(annot['description'], -1)
+            if label == -1:
+                continue
+            start = int(annot['onset'] * sfreq)
+            end = start + samples_per_window
+            if end <= raw.n_times:
+                segment = raw.get_data(start=start, stop=end)[0]
+                if len(segment) == samples_per_window:
+                    x_all.append(segment)
+                    y_all.append(label)
 
-    for annot in annotations:
-        desc = annot['description']
-        label = label_map.get(desc, -1)
-        if label == -1:
-            continue
+    x_np = np.stack(x_all)
+    x_np = (x_np - np.mean(x_np, axis=1, keepdims=True)) / (np.std(x_np, axis=1, keepdims=True) + 1e-8)
+    x_np = x_np[:, np.newaxis, :]
+    y_np = np.array(y_all)
+    print(f"✅ Total de fenêtres extraites : {len(x_np)}")
+    return x_np, y_np
 
-        start_sample = int(annot['onset'] * sfreq)
-        end_sample = start_sample + samples_per_window
-
-        if end_sample <= raw.n_times:
-            segment = raw.get_data(start=start_sample, stop=end_sample)[0]
-            if segment.shape[0] == samples_per_window:
-                x_all.append(segment)
-                y_all.append(label)
-
-print(f"✅ Total de fenêtres extraites : {len(x_all)}")
-
-x_np = np.stack(x_all)
-x_np = (x_np - np.mean(x_np)) / np.std(x_np)
-x_np = x_np[:, np.newaxis, :]
-y_np = np.array(y_all)
-
+psg_files, hyp_files = list_sleep_edf_files(DATA_DIR)
+x_np, y_np = extract_windows(psg_files, hyp_files, WINDOW_SEC)
 
 # === Dataset PyTorch ===
 class EEGSleepDataset(Dataset):
     def __init__(self, x, y):
         self.x = torch.tensor(x, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.long)
-
     def __len__(self):
         return len(self.x)
-
     def __getitem__(self, idx):
         return self.x[idx], self.y[idx]
 
 dataset = EEGSleepDataset(x_np, y_np)
-train_loader = DataLoader(dataset, batch_size=128, shuffle=True)
+train_size = int(0.8 * len(dataset))
+val_size = len(dataset) - train_size
+train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-
-# === CNN pour classification des stades de sommeil ===
+# === Modèle CNN ===
 class SleepStageCNN(nn.Module):
-    def __init__(self, input_channels=1, input_length=3000, num_classes=5):
-        super(SleepStageCNN, self).__init__()
-        self.conv1 = nn.Conv1d(input_channels, 32, kernel_size=3, padding=1)
-        self.pool1 = nn.MaxPool1d(kernel_size=2, padding=1)
-
-        self.conv2 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
-        self.pool2 = nn.MaxPool1d(kernel_size=2, padding=1)
-
-        self.conv3 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
-        self.conv4 = nn.Conv1d(128, 128, kernel_size=3, padding=1)
-        self.pool3 = nn.MaxPool1d(kernel_size=2, padding=1)
+    def __init__(self, input_channels=1, input_length=WINDOW_SEC*100, num_classes=NUM_CLASSES):
+        super().__init__()
+        self.conv1 = nn.Conv1d(input_channels, 32, 3, padding=1)
+        self.pool1 = nn.MaxPool1d(2, padding=1)
+        self.conv2 = nn.Conv1d(32, 64, 3, padding=1)
+        self.pool2 = nn.MaxPool1d(2, padding=1)
+        self.conv3 = nn.Conv1d(64, 128, 3, padding=1)
+        self.conv4 = nn.Conv1d(128, 128, 3, padding=1)
+        self.pool3 = nn.MaxPool1d(2, padding=1)
 
         with torch.no_grad():
             dummy = torch.zeros(1, input_channels, input_length)
-            out = self.pool3(F.relu(self.conv4(F.relu(self.conv3(
-                self.pool2(F.relu(self.conv2(
-                    self.pool1(F.relu(self.conv1(dummy)))
-                )))
-            )))))
+            out = self.pool3(F.relu(self.conv4(F.relu(self.conv3(self.pool2(F.relu(self.conv2(self.pool1(F.relu(self.conv1(dummy)))))))))))
             self.flatten_dim = out.view(1, -1).shape[1]
 
-        self.fc1 = nn.Linear(self.flatten_dim, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 64)
-        self.out = nn.Linear(64, num_classes)
+        self.fc = nn.Sequential(
+            nn.Linear(self.flatten_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_classes)
+        )
 
     def forward(self, x):
         x = F.relu(self.conv1(x)); x = self.pool1(x)
         x = F.relu(self.conv2(x)); x = self.pool2(x)
         x = F.relu(self.conv3(x)); x = F.relu(self.conv4(x)); x = self.pool3(x)
         x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        return self.out(x)
+        return self.fc(x)
 
-# === Entraînement ===
-model = SleepStageCNN(input_channels=1, input_length=3000, num_classes=5)
-#model.load_state_dict(torch.load("sleep_stage_cnn.pth"))
+model = SleepStageCNN(input_channels=1, input_length=x_np.shape[2], num_classes=NUM_CLASSES)
 criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
-def evaluate(model, data_loader, criterion):
+# === Évaluation ===
+def evaluate(model, loader):
     model.eval()
-    total_loss = 0
-    total_samples = 0
+    total_loss, total_samples = 0, 0
     with torch.no_grad():
-        for batch_x, batch_y in data_loader:
-            outputs = model(batch_x)
-            loss = criterion(outputs, batch_y)  # CrossEntropyLoss
-            total_loss += loss.item() * batch_y.size(0)  # perte totale pondérée
-            total_samples += batch_y.size(0)
-        print('total_samples:',total_samples)
+        for x_batch, y_batch in loader:
+            preds = model(x_batch)
+            loss = criterion(preds, y_batch)
+            total_loss += loss.item() * y_batch.size(0)
+            total_samples += y_batch.size(0)
     return total_loss / total_samples
 
-for cycle in range(5):
-    for epoch in range(2):
-        model.train()
-        total_loss = 0
-        total_samples = 0
-        for batch_x, batch_y in train_loader:
-            optimizer.zero_grad()
-            preds = model(batch_x)
-            loss = criterion(preds, batch_y)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            total_samples += batch_y.size(0)
-        avg_loss=total_loss / total_samples
-        losses.append(avg_loss)  # stocker la perte
-        print(f"Époque {epoch + 1}, Perte: {avg_loss:.4f}")
-    model.eval()
-    val_total_loss = 0
-    val_total_samples = 0
-    with torch.no_grad():
-        for batch_x, batch_y in train_loader:  # ou juste un échantillon
-            preds = model(batch_x)
-            loss = criterion(preds, batch_y)
-            val_total_loss += loss.item()
-            val_total_samples += batch_y.size(0)
-        
-    val_avg_loss = val_total_loss / val_total_samples
-    loss_validation.append(val_avg_loss)
-    print(f"✅ Validation Loss: {val_avg_loss:.4f}")
+# === Boucle d'entraînement avec wandb ===
+train_losses, val_losses = [], []
 
-# === Affichage de la courbe de perte ===
-plt.figure(figsize=(12, 5))
+for epoch in range(EPOCHS):
+    model.train()
+    total_loss, total_samples = 0, 0
+    for x_batch, y_batch in train_loader:
+        optimizer.zero_grad()
+        preds = model(x_batch)
+        loss = criterion(preds, y_batch)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * y_batch.size(0)
+        total_samples += y_batch.size(0)
+    train_loss = total_loss / total_samples
+    val_loss = evaluate(model, val_loader)
+    
+    train_losses.append(train_loss)
+    val_losses.append(val_loss)
+    
+    # Log dans wandb
+    wandb.log({
+        "epoch": epoch + 1,
+        "train_loss": train_loss,
+        "val_loss": val_loss
+    })
+    
+    print(f"Époque {epoch+1}/{EPOCHS} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
 
-X_train = range(1, len(losses) + 1)
-X_val = range(2,len(losses)+1, 2)
-Y1, Y2 = losses, loss_validation
-plt.plot(X_train, Y1, marker='o', label="Loss")
-plt.plot(X_val, Y2, marker='x', label="Validation Loss", color='red')
-plt.title("Courbe de perte pendant l'entraînement")
-plt.xlabel("Époque")
-plt.ylabel("Perte totale")
+# === Courbes locales ===
+plt.figure(figsize=(10,5))
+plt.plot(range(1, EPOCHS+1), train_losses, marker='o', label='Train Loss')
+plt.plot(range(1, EPOCHS+1), val_losses, marker='x', color='red', label='Validation Loss')
+plt.xlabel('Époque')
+plt.ylabel('Loss')
+plt.title('Courbe de perte')
 plt.grid(True)
 plt.legend()
+plt.show()
 
-plt.tight_layout()
-plt.show(block=True)
-
-#Sauvegarde du modèle après entrainement
+# === Sauvegarde du modèle et fin de run ===
 torch.save(model.state_dict(), "sleep_stage_cnn.pth")
-print("✅ Modèle sauvegardé sous 'sleep_stage_cnn.pth'")
+wandb.finish()
+print("✅ Modèle sauvegardé et logging wandb terminé")
