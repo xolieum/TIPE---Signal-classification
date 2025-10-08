@@ -15,7 +15,7 @@ BATCH_SIZE = 128
 NUM_CLASSES = 5
 EPOCHS = 100
 LR = 1e-5
-
+sfreq = 100
 # === Initialisation wandb ===
 wandb.init(
     project="sleep_stage_classification",
@@ -37,6 +37,10 @@ def list_sleep_edf_files(data_dir):
     print(f"🧠 {len(hyp_files)} fichiers Hypnogramme trouvés")
     return psg_files, hyp_files
 
+#Fonction du filtre passe bande
+def bandpass_filter(data, sfreq, l_freq, h_freq):
+    return mne.filter.filter_data(data, sfreq=sfreq, l_freq=l_freq, h_freq=h_freq, verbose=False)
+
 # === Mapping des labels ===
 label_map = {
     'Sleep stage W': 0,
@@ -47,6 +51,38 @@ label_map = {
     'Sleep stage R': 4,
 }
 
+bands = {
+    'Beta'  : (12,30),
+    'Alpha' : (8,12),
+    'Theta' : (4,8),
+    'Delta' : (0.5,4),
+}
+
+band_names = list(bands.keys())
+
+def extract_band_signals(x_np, sfreq, bands):
+    band_signals = []
+    for band, (low, high) in bands.items():
+        filtered = np.array([bandpass_filter(sig, sfreq, low, high) for sig in x_np[:,0,:]])
+        band_signals.append(filtered[:, np.newaxis, :])  # shape: (N, 1, L)
+    return band_signals
+
+class MultiBandEEGDataset(Dataset):
+    def __init__(self, band_signals, y, band_names):
+        self.band_signals = band_signals  # liste de np.ndarray
+        self.y = torch.tensor(y, dtype=torch.long)
+        self.band_names = band_names
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        x_dict = {
+            band: torch.tensor(self.band_signals[i][idx], dtype=torch.float32)
+            for i, band in enumerate(self.band_names)
+        }
+        return x_dict, self.y[idx]
+    
 # === Extraction des fenêtres ===
 def extract_windows(psg_files, hyp_files, window_sec):
     x_all, y_all = [], []
@@ -95,7 +131,8 @@ class EEGSleepDataset(Dataset):
     def __getitem__(self, idx):
         return self.x[idx], self.y[idx]
 
-dataset = EEGSleepDataset(x_np, y_np)
+band_signals = extract_band_signals(x_np, sfreq, bands)
+dataset = MultiBandEEGDataset(band_signals, y_np, band_names)
 train_size = int(0.8 * len(dataset))
 val_size = len(dataset) - train_size
 train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
@@ -103,36 +140,42 @@ train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 # === Modèle CNN ===
-class SleepStageCNN(nn.Module):
-    def __init__(self, input_channels=1, input_length=WINDOW_SEC*100, num_classes=NUM_CLASSES):
+class MultiBandCNN(nn.Module):
+    def __init__(self, input_length, num_classes=NUM_CLASSES, bands=band_names):
         super().__init__()
-        self.conv1 = nn.Conv1d(input_channels, 32, 3, padding=1)
-        self.pool1 = nn.MaxPool1d(2, padding=1)
-        self.conv2 = nn.Conv1d(32, 64, 3, padding=1)
-        self.pool2 = nn.MaxPool1d(2, padding=1)
-
+        self.branches = nn.ModuleDict({
+            band: nn.Sequential(
+                nn.Conv1d(1, 32, 3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool1d(2),
+                nn.Conv1d(32, 64, 3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool1d(2),
+            ) for band in bands
+        })
+        # Calcule la dimension finale
         with torch.no_grad():
-            dummy = torch.zeros(1, input_channels, input_length)
-            out = self.pool2(F.relu(self.conv2(self.pool1(F.relu(self.conv1(dummy))))))
-            self.flatten_dim = out.view(1, -1).shape[1]
-
+            dummy = torch.zeros(1, 1, input_length)
+            out = self.branches[bands[0]](dummy)
+            flatten_dim = out.view(1, -1).shape[1] * len(bands)
         self.fc = nn.Sequential(
-            nn.Linear(self.flatten_dim, 256),
+            nn.Linear(flatten_dim, 256),
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, num_classes)
+            nn.Linear(128, num_classes)
         )
 
-    def forward(self, x):
-        x = F.relu(self.conv1(x)); x = self.pool1(x)
-        x = F.relu(self.conv2(x)); x = self.pool2(x)
-        x = x.view(x.size(0), -1)
-        return self.fc(x)
+    def forward(self, x_dict):
+        features = []
+        for band, x in x_dict.items():
+            out = self.branches[band](x)
+            features.append(out.view(out.size(0), -1))
+        x_cat = torch.cat(features, dim=1)
+        return self.fc(x_cat)
 
-model = SleepStageCNN(input_channels=1, input_length=x_np.shape[2], num_classes=NUM_CLASSES)
+    
+model = MultiBandCNN(input_length=x_np.shape[2], num_classes=NUM_CLASSES, bands=band_names)
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
@@ -141,8 +184,8 @@ def evaluate(model, loader):
     model.eval()
     total_loss, total_samples = 0, 0
     with torch.no_grad():
-        for x_batch, y_batch in loader:
-            preds = model(x_batch)
+        for x_dict, y_batch in loader:
+            preds = model(x_dict)
             loss = criterion(preds, y_batch)
             total_loss += loss.item() * y_batch.size(0)
             total_samples += y_batch.size(0)
@@ -154,9 +197,9 @@ train_losses, val_losses = [], []
 for epoch in range(EPOCHS):
     model.train()
     total_loss, total_samples = 0, 0
-    for x_batch, y_batch in train_loader:
+    for x_dict, y_batch in train_loader:
         optimizer.zero_grad()
-        preds = model(x_batch)
+        preds = model(x_dict)
         loss = criterion(preds, y_batch)
         loss.backward()
         optimizer.step()
@@ -189,6 +232,6 @@ plt.legend()
 plt.show()
 
 # === Sauvegarde du modèle et fin de run ===
-torch.save(model.state_dict(), "sleep_stage_cnn.pth")
+torch.save(model.state_dict(), "sleep_stage_cnn_multyband.pth")
 wandb.finish()
 print("✅ Modèle sauvegardé et logging wandb terminé")
